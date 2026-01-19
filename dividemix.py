@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.mixture import GaussianMixture
 
+
 @torch.no_grad()
 def sharpen(p, T=0.5):
     p_pow = p ** (1.0 / T)
