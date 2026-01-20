@@ -1,3 +1,6 @@
 DivideMix/runs
+DivideMix/__pycache__
 .vscode
 __pycache__
+.gitignore
+
