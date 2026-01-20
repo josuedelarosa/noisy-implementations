@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.mixture import GaussianMixture
 from torch.utils.data import DataLoader, Dataset
+from sklearn.metrics import roc_auc_score, confusion_matrix, balanced_accuracy_score
 
 from models import ModelConfig, build_model
 from utils import (
@@ -51,10 +52,12 @@ class NpyPatchDataset(Dataset):
         filename_pattern: str = "{patient_id}_{nodule_number}_case{case_number}.npy",
         hw: Optional[int] = None,
         to_binary: bool = True,
+        drop_malignancy_3: bool = False,
         bin_threshold: float = 3.0,
         augment: bool = False,
         return_index: bool = True,
         verify_exists: bool = True,
+        
     ):
         self.df = pd.read_csv(csv_path)
 
@@ -75,6 +78,14 @@ class NpyPatchDataset(Dataset):
         self.augment = augment
         self.return_index = return_index
 
+        self.labels_bin: np.ndarray
+
+        # If binary mode and requested: drop malignancy==3
+        if to_binary and drop_malignancy_3:
+            # handle float/mean malignancy too: drop anything close to 3
+            self.df = self.df[~np.isclose(self.df[label_col].astype(float), 3.0)].reset_index(drop=True)
+
+
         # Build filenames from pattern
         self.files: List[str] = []
         for _, row in self.df.iterrows():
@@ -85,7 +96,12 @@ class NpyPatchDataset(Dataset):
             )
             self.files.append(fname)
 
-        self.labels_raw = self.df[self.label_col].values
+        self.labels_raw: np.ndarray = self.df[self.label_col].values
+
+        if self.to_binary:
+            self.labels_bin: np.ndarray = (
+                self.labels_raw.astype(np.float32) >= float(self.bin_threshold)
+            ).astype(np.int64)
 
         if verify_exists:
             # Fail fast on missing files (common issue when pattern mismatch)
@@ -352,20 +368,60 @@ def divmix_epoch(
 
 
 @torch.no_grad()
-def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, float]:
+def evaluate_with_metrics(model, loader, device, num_classes: int):
     model.eval()
+
     loss_meter = AverageMeter("val_loss")
-    acc_meter = AverageMeter("val_acc")
+    acc_meter  = AverageMeter("val_acc")
+
+    all_probs = []
+    all_y = []
 
     for x, y, _ in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
+
         logits = model(x)
         loss = F.cross_entropy(logits, y)
         loss_meter.update(loss.item(), n=x.size(0))
         acc_meter.update(accuracy_top1(logits, y), n=x.size(0))
 
-    return loss_meter.avg, acc_meter.avg
+        probs = F.softmax(logits, dim=1).detach().cpu().numpy()
+        all_probs.append(probs)
+        all_y.append(y.detach().cpu().numpy())
+
+    probs = np.concatenate(all_probs, axis=0)
+    y_true = np.concatenate(all_y, axis=0)
+
+    # Confusion matrix + derived stats
+    y_pred = probs.argmax(axis=1)
+    cm = confusion_matrix(y_true, y_pred)
+    bacc = balanced_accuracy_score(y_true, y_pred)
+
+    # AUC
+    auc = None
+    if num_classes == 2:
+        # use P(class=1)
+        try:
+            auc = float(roc_auc_score(y_true, probs[:, 1]))
+        except ValueError:
+            auc = None
+    else:
+        # multiclass one-vs-rest AUC
+        try:
+            auc = float(roc_auc_score(y_true, probs, multi_class="ovr"))
+        except ValueError:
+            auc = None
+
+    metrics = {
+        "loss": float(loss_meter.avg),
+        "acc": float(acc_meter.avg),
+        "bacc": float(bacc),
+        "auc": auc,
+        "cm": cm,
+    }
+    return metrics
+
 
 
 # -------------------------
@@ -398,6 +454,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_binary", dest="binary", action="store_false")
     p.set_defaults(binary=True)
     p.add_argument("--bin_threshold", type=float, default=3.0, help=">= threshold => malignant (binary mode)")
+    p.add_argument(
+    "--drop_malignancy_3",
+    action="store_true",
+    help="Only in binary mode: drop samples with malignancy==3 from the dataset",)
+
 
     # Model
     p.add_argument("--model", type=str, default="smallcnn", choices=["smallcnn", "resnet18", "resnet34"])
@@ -446,6 +507,7 @@ def main() -> None:
         hw=args.hw,
         to_binary=args.binary,
         bin_threshold=args.bin_threshold,
+        drop_malignancy_3=args.drop_malignancy_3,
         augment=False,
         return_index=True,
         verify_exists=True,
@@ -472,6 +534,7 @@ def main() -> None:
         hw=args.hw,
         to_binary=args.binary,
         bin_threshold=args.bin_threshold,
+        drop_malignancy_3=args.drop_malignancy_3,
         augment=True,
         return_index=True,
         verify_exists=False,  # avoid double-check cost
@@ -515,6 +578,7 @@ def main() -> None:
     optB = torch.optim.AdamW(netB.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_val = -1.0
+    best_auc = -1.0
 
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
@@ -527,10 +591,7 @@ def main() -> None:
             print(f"  Warmup B: loss={lb:.4f} acc={accb:.4f}")
 
         else:
-            # 1) Compute per-sample losses on train set (no augmentation loader)
-            lossesA = compute_per_sample_loss(netA, eval_train_loader, device)
-            lossesB = compute_per_sample_loss(netB, eval_train_loader, device)
-
+            
             # These losses arrays are sized to len(subset), but we need per full dataset indices.
             # Because eval_train_loader is a Subset, indices are re-mapped; easiest fix:
             # We'll rebuild losses over FULL base_eval then slice by train_idx.
@@ -561,6 +622,28 @@ def main() -> None:
 
             labeled_idx_for_B = train_idx[pA_full[train_idx] > args.tau]
             unlabeled_idx_for_B = train_idx[pA_full[train_idx] <= args.tau]
+
+            if args.binary:
+                # mirror the dataset's binary mapping
+                y_np = (np.asarray(base_eval.labels_raw, dtype=np.float32) >= float(args.bin_threshold)).astype(np.int64)
+            else:
+                # mirror the dataset's multiclass mapping: {1..5} -> {0..4}
+                y_np = np.round(np.asarray(base_eval.labels_raw, dtype=np.float32)).astype(np.int64)
+                y_np = np.clip(y_np, 1, 5) - 1
+
+            def pct_pos(indices):
+                if len(indices) == 0:
+                    return float("nan")
+                return float(y_np[indices].mean())
+
+            print(
+                f"  A labeled pos%={pct_pos(labeled_idx_for_A):.3f} "
+                f"unlabeled pos%={pct_pos(unlabeled_idx_for_A):.3f}"
+            )
+            print(
+                f"  B labeled pos%={pct_pos(labeled_idx_for_B):.3f} "
+                f"unlabeled pos%={pct_pos(unlabeled_idx_for_B):.3f}"
+            )
 
             print(f"  Split for A: labeled={len(labeled_idx_for_A)} unlabeled={len(unlabeled_idx_for_A)}")
             print(f"  Split for B: labeled={len(labeled_idx_for_B)} unlabeled={len(unlabeled_idx_for_B)}")
@@ -626,15 +709,21 @@ def main() -> None:
             print(f"  DivMix B: Lx={LxB:.4f} Lu={LuB:.4f} (lambda_u={w_u:.2f})")
 
         # Validation
-        vlossA, vaccA = evaluate(netA, val_loader, device)
-        vlossB, vaccB = evaluate(netB, val_loader, device)
-        vacc = max(vaccA, vaccB)
-        print(f"  Val A: loss={vlossA:.4f} acc={vaccA:.4f}")
-        print(f"  Val B: loss={vlossB:.4f} acc={vaccB:.4f}")
+        mA = evaluate_with_metrics(netA, val_loader, device, num_classes=num_classes)
+        mB = evaluate_with_metrics(netB, val_loader, device, num_classes=num_classes)
+
+        print(f"  Val A: loss={mA['loss']:.4f} acc={mA['acc']:.4f} bacc={mA['bacc']:.4f} auc={mA['auc']}")
+        print(f"  ConfMat A:\n{mA['cm']}")
+        print(f"  Val B: loss={mB['loss']:.4f} acc={mB['acc']:.4f} bacc={mB['bacc']:.4f} auc={mB['auc']}")
+        print(f"  ConfMat B:\n{mB['cm']}")
+        
+        scoreA = (mA["auc"] if mA["auc"] is not None else -1.0)
+        scoreB = (mB["auc"] if mB["auc"] is not None else -1.0)
+        current_auc = max(scoreA, scoreB)
 
         # Checkpoint
-        if vacc > best_val:
-            best_val = vacc
+        if current_auc > best_auc:
+            best_auc = current_auc
             save_checkpoint(
                 os.path.join(args.outdir, "best.pt"),
                 epoch=epoch,
@@ -642,7 +731,7 @@ def main() -> None:
                 model_b=netB,
                 opt_a=optA,
                 opt_b=optB,
-                extra={"best_val_acc": best_val, "args": vars(args)},
+                extra={"best_val_auc": best_auc, "args": vars(args)},
             )
 
         if (epoch % args.save_every) == 0 or epoch == args.epochs:
@@ -656,7 +745,7 @@ def main() -> None:
                 extra={"best_val_acc": best_val, "args": vars(args)},
             )
 
-    print(f"\nDone. Best val acc: {best_val:.4f}")
+    print(f"\nDone. Best val AUC: {best_auc:.4f}")
     print(f"Saved to: {args.outdir}")
 
 
