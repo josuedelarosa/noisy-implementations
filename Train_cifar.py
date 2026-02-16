@@ -29,6 +29,9 @@ parser.add_argument('--gpuid', default=0, type=int)
 parser.add_argument('--num_class', default=10, type=int)
 parser.add_argument('--data_path', default='./cifar-10', type=str, help='path to dataset')
 parser.add_argument('--dataset', default='cifar10', type=str)
+parser.add_argument('--test_ratio', default=0.2, type=float, help='holdout ratio for test split')
+parser.add_argument('--split_seed', default=123, type=int, help='seed for train/test split')
+
 args = parser.parse_args()
 
 torch.cuda.set_device(args.gpuid)
@@ -46,10 +49,10 @@ def train(epoch,net,net2,optimizer,labeled_trainloader,unlabeled_trainloader):
     num_iter = (len(labeled_trainloader.dataset)//args.batch_size)+1
     for batch_idx, (inputs_x, inputs_x2, labels_x, w_x) in enumerate(labeled_trainloader):      
         try:
-            inputs_u, inputs_u2 = unlabeled_train_iter.next()
+            inputs_u, inputs_u2 = next(unlabeled_train_iter)
         except:
             unlabeled_train_iter = iter(unlabeled_trainloader)
-            inputs_u, inputs_u2 = unlabeled_train_iter.next()                 
+            inputs_u, inputs_u2 = next(unlabeled_train_iter)                 
         batch_size = inputs_x.size(0)
         
         # Transform label to one-hot
